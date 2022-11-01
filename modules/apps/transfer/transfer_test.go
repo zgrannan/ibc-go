@@ -1,6 +1,7 @@
 package transfer_test
 
 import (
+	"fmt"
 	"testing"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -20,13 +21,15 @@ type TransferTestSuite struct {
 	chainA *ibctesting.TestChain
 	chainB *ibctesting.TestChain
 	chainC *ibctesting.TestChain
+	chainD *ibctesting.TestChain
 }
 
 func (suite *TransferTestSuite) SetupTest() {
-	suite.coordinator = ibctesting.NewCoordinator(suite.T(), 3)
+	suite.coordinator = ibctesting.NewCoordinator(suite.T(), 4)
 	suite.chainA = suite.coordinator.GetChain(ibctesting.GetChainID(1))
 	suite.chainB = suite.coordinator.GetChain(ibctesting.GetChainID(2))
 	suite.chainC = suite.coordinator.GetChain(ibctesting.GetChainID(3))
+	suite.chainD = suite.coordinator.GetChain(ibctesting.GetChainID(4))
 }
 
 func NewTransferPath(chainA, chainB *ibctesting.TestChain) *ibctesting.Path {
@@ -37,6 +40,91 @@ func NewTransferPath(chainA, chainB *ibctesting.TestChain) *ibctesting.Path {
 	path.EndpointB.ChannelConfig.Version = types.Version
 
 	return path
+}
+
+func testTransfer(
+	suite *TransferTestSuite,
+	from *ibctesting.TestChain,
+	to *ibctesting.TestChain,
+	amount sdk.Int,
+	trace types.DenomTrace,
+) types.DenomTrace {
+	coin := sdk.NewCoin(trace.IBCDenom(), amount)
+	timeoutHeight := clienttypes.NewHeight(1, 110)
+	path := NewTransferPath(from, to)
+	suite.coordinator.Setup(path)
+	msg := types.NewMsgTransfer(
+		path.EndpointA.ChannelConfig.PortID,
+		path.EndpointA.ChannelID,
+		coin,
+		from.SenderAccount.GetAddress().String(),
+		to.SenderAccount.GetAddress().String(),
+		timeoutHeight,
+		0,
+		"",
+	)
+	res, err := from.SendMsgs(msg)
+	suite.Require().NoError(err) // message committed
+
+	packet, err := ibctesting.ParsePacketFromEvents(res.GetEvents())
+	suite.Require().NoError(err)
+
+	// relay send
+	err = path.RelayPacket(packet)
+	suite.Require().NoError(err) // relay committed
+
+	prefixedDenom := types.GetPrefixedDenom(
+		path.EndpointB.ChannelConfig.PortID,
+		path.EndpointB.ChannelID,
+		trace.GetFullDenomPath(),
+	)
+
+	voucherDenomTrace := types.ParseDenomTrace(prefixedDenom)
+	fmt.Printf("Path: %v\n", voucherDenomTrace.GetFullDenomPath())
+	balance := to.GetSimApp().BankKeeper.GetBalance(
+		to.GetContext(),
+		to.SenderAccount.GetAddress(),
+		voucherDenomTrace.IBCDenom(),
+	)
+
+	transferCoin := sdk.NewCoin(
+		voucherDenomTrace.IBCDenom(),
+		coin.Amount,
+	)
+
+	fmt.Printf("TransferCoin: %v\n", transferCoin)
+	suite.Require().Equal(
+		transferCoin,
+		balance,
+	)
+	return voucherDenomTrace
+}
+
+func (suite *TransferTestSuite) TestTransfer2() {
+	amount, ok := sdk.NewIntFromString("10")
+	suite.Require().True(ok)
+	coin := sdk.NewCoin(sdk.DefaultBondDenom, amount)
+	trace := testTransfer(
+		suite,
+		suite.chainD,
+		suite.chainC,
+		amount,
+		types.ParseDenomTrace(coin.Denom),
+	)
+	trace2 := testTransfer(
+		suite,
+		suite.chainC,
+		suite.chainB,
+		amount,
+		trace,
+	)
+	testTransfer(
+		suite,
+		suite.chainB,
+		suite.chainA,
+		amount,
+		trace2,
+	)
 }
 
 // constructs a send from chainA to chainB on the established channel/connection
